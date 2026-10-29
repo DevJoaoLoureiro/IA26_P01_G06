@@ -1,7 +1,7 @@
 """Projeto IA26_P01_G18 — algoritmos de rotas (datasets data_tiny e data_small).
 
 Modelo: recolha -> centro -> entrega, com capacidade e retorno ao centro.
-CSP respeita janelas temporais; A* ignora-as por opção de modelação.
+CSP e A* respeitam as janelas temporais na procura da frota.
 A data da encomenda é considerada a primeira data permitida para recolha.
 Inclui as abordagens para um veículo e para frota de dois veículos.
 Os algoritmos de pesquisa usam limites e não garantem otimalidade global.
@@ -114,7 +114,7 @@ def load_problem(folder="data", vehicle_id=1, start_time=None):
         weight = float(r.weight_kg) if "weight_kg" in r._fields else float(r.quantity) * float(product.unit_weight_kg)
         item_id = int(r.order_item_id)
         # Seleção comum de artigos temporalmente elegíveis para comparação justa.
-        # A* ignora as janelas durante a procura, mas usa a mesma instância.
+        # A frota usa as mesmas janelas temporais em todos os métodos.
         if pickup_end < ready:
             rejected.append((item_id, "janela de recolha impossível"))
             continue
@@ -566,69 +566,104 @@ def fleet_gbfs(problem, heuristic_variant=1, max_expansions=5000):
 
 
 def fleet_astar(problem, heuristic_variant=1, max_expansions=10000):
-    """Procura conjunta limitada; pode não encontrar solução no limite.
-    Heurísticas sem garantia de admissibilidade -> não garante ótimo.
+    """A* para dois veículos, respeitando capacidade, precedência e horários.
+
+    H1: limite inferior 0 (custo uniforme, admissível).
+    H2: menor deslocação até uma ação necessária, limite inferior admissível
+        para distâncias não negativas, sem garantia de consistência.
+    O limite de expansões impede garantir solução ou otimalidade se atingido.
     """
+    if heuristic_variant not in (1, 2):
+        raise ValueError("heuristic_variant deve ser 1 ou 2")
+    if max_expansions < 1:
+        raise ValueError("max_expansions deve ser positivo")
     start = time.perf_counter()
-    root = tuple(State(v.center_location,problem.start_time) for v in problem.vehicles)
+    root = tuple(State(v.center_location, problem.start_time) for v in problem.vehicles)
     ids = frozenset(r.item_id for r in problem.requests)
     counter = itertools.count()
-    queue = [(0.,next(counter),root)]
-    seen = set()
+
+    def delivered_ids(states):
+        return frozenset().union(*(s.delivered for s in states))
+
+    def heuristic(states):
+        if heuristic_variant == 1 or delivered_ids(states) == ids:
+            return 0.0
+        choices = list(_fleet_candidates(problem, states, ids - delivered_ids(states),
+                                         check_time_windows=True))
+        return min((km for _, _, km, _, _ in choices), default=0.0)
+
+    queue = [(heuristic(root), next(counter), root)]
+    # Guardar tempos no estado: dois estados com a mesma posição/carga mas
+    # horários diferentes não têm necessariamente os mesmos sucessores.
+    best_cost = {}
     expanded = 0
     best_partial = root
     while queue and expanded < max_expansions:
-        _,_,states = heapq.heappop(queue)
-        delivered = frozenset().union(*(s.delivered for s in states))
-        if len(delivered)>len(frozenset().union(*(s.delivered for s in best_partial))):
-            best_partial=states
-        if delivered==ids:
-            return _fleet_complete(problem,states,len(delivered),expanded,start,"fleet_astar")
-        key=tuple((s.location,s.picked,s.warehouse_passed,s.delivered,round(s.load,5)) for s in states)
-        if key in seen:
+        _, _, states = heapq.heappop(queue)
+        delivered = delivered_ids(states)
+        if (len(delivered), -sum(s.km for s in states)) > (len(delivered_ids(best_partial)), -sum(s.km for s in best_partial)):
+            best_partial = states
+        if delivered == ids:
+            return _fleet_complete(problem, states, len(delivered), expanded,
+                                   start, "fleet_astar")
+        key = tuple((s.location, s.picked, s.warehouse_passed, s.delivered,
+                     round(s.load, 5), s.moment) for s in states)
+        cost = sum(s.km for s in states)
+        if cost >= best_cost.get(key, math.inf) - 1e-9:
             continue
-        seen.add(key)
-        expanded+=1
-        for vi,nxt,km,kind,item in _fleet_candidates(problem,states,ids-delivered,check_time_windows=False):
-            new_states=tuple(nxt if j==vi else s for j,s in enumerate(states))
-            cost=sum(s.km for s in new_states)
-            remaining=len(ids)-len(frozenset().union(*(s.delivered for s in new_states)))
-            # h1: 0 é admissível mas pouco informativa; h2: distância mínima 
-            # a uma operação possível (não garantidamente admissível).
-           
-            h = 0.0
-
-            if heuristic_variant == 2:
-                if remaining > 0:
-                    pendentes = ids - frozenset().union(
-                        *(s.delivered for s in new_states)
-                    )
-
-                    opts = list(
-                        _fleet_candidates(
-                            problem,
-                            new_states,
-                            pendentes,
-                            check_time_windows=False
-                        )
-                    )
-
-                    h = min(
-                        (x[2] for x in opts),
-                        default=0.0
-                    )
-
-            elif heuristic_variant != 1:
-                raise ValueError(
-                    "heuristic_variant deve ser 1 ou 2"
-                )
-
-            heapq.heappush(queue,(cost+h,next(counter),new_states))
-    delivered=frozenset().union(*(s.delivered for s in best_partial))
-    result=_fleet_complete(problem,best_partial,len(delivered),expanded,start,"fleet_astar",
-                 "Procura terminou sem solução completa (limite ou inviabilidade)")
-    result.feasible=False
+        best_cost[key] = cost
+        expanded += 1
+        for vi, nxt, _, _, _ in _fleet_candidates(problem, states, ids - delivered,
+                                                  check_time_windows=True):
+            successors = tuple(nxt if j == vi else s for j, s in enumerate(states))
+            g = sum(s.km for s in successors)
+            heapq.heappush(queue, (g + heuristic(successors), next(counter), successors))
+    delivered = delivered_ids(best_partial)
+    result = _fleet_complete(problem, best_partial, len(delivered), expanded,
+                             start, "fleet_astar",
+                             "Sem solução completa dentro do limite de expansões ou fronteira esgotada")
+    result.feasible = False
     return result
+
+
+def validar_rota_frota(problem, result, tolerance_km=0.02):
+    """Reexecuta operações da rota com todas as restrições ativas.
+
+    Retorna (válida, mensagens). Uma rota parcial não é considerada completa.
+    """
+    errors = []
+    if not result.routes:
+        return False, ["Resultado sem rotas"]
+    sequences = []
+    for vehicle in problem.vehicles:
+        route = result.routes.get(vehicle.vehicle_id)
+        if route is None:
+            errors.append(f"Veículo {vehicle.vehicle_id}: rota em falta")
+            sequences.append([])
+            continue
+        if not route or route[-1][0] != "regresso" or route[-1][2] != vehicle.center_location:
+            errors.append(f"Veículo {vehicle.vehicle_id}: regresso ao centro em falta")
+        sequences.append([(kind, item) for kind, item, _, _ in route if kind != "regresso"])
+    if errors:
+        return False, errors
+    replay = evaluate_fleet_sequences(problem, sequences)
+    if replay is None:
+        return False, ["A sequência viola precedência, capacidade, horários ou cobertura"]
+    for vehicle in problem.vehicles:
+        original = result.routes[vehicle.vehicle_id]
+        expected = replay.routes[vehicle.vehicle_id]
+        if len(original) != len(expected):
+            errors.append(f"Veículo {vehicle.vehicle_id}: número de operações divergente")
+            continue
+        for i, (old, new) in enumerate(zip(original, expected), start=1):
+            if old[:3] != new[:3] or pd.Timestamp(old[3]) != pd.Timestamp(new[3]):
+                errors.append(f"Veículo {vehicle.vehicle_id}: operação {i} não coincide com a simulação")
+                break
+    if abs(replay.distance_km - result.distance_km) > tolerance_km:
+        errors.append("Distância declarada diferente da distância recalculada")
+    if result.delivered != len(problem.requests) or not result.feasible:
+        errors.append("Resultado não assinalado como completo")
+    return not errors, errors
 
 
 def fleet_summary(results):

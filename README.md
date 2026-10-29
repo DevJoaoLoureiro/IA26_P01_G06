@@ -1,48 +1,25 @@
-PROJETO 1 — INTELIGÊNCIA ARTIFICIAL (2026/2027)
-Grupo 18 — IA26_P01_G18
+Projeto 1 — Inteligência Artificial 2026/27 — Grupo 06
+GitHub: https://github.com/DevJoaoLoureiro/IA26_P01_G06
 
-TEMA:
-Otimização de Rotas para Distribuição de Alimentos Locais
+CONTEÚDO
+01_Project01_G06.ipynb — notebook principal com metodologia, resultados e gráficos.
+01_eda_tiny.ipynb — análise exploratória.
+02_relatorio.ipynb — notebook original, preservado para rastreabilidade.
+algoritmos.py — classes, algoritmos e validador de rotas.
+test_validacao.py — testes de regressão executáveis.
+data/ — 12 ficheiros CSV de entrada.
 
-REPOSITÓRIO GITHUB:
-https://github.com/DevJoaoLoureiro/IA26_P01_G18
+EXECUÇÃO
+No Google Colab: abrir 01_Project01_G06.ipynb e executar as células.
+O notebook original clona o repositório GitHub: é necessário atualizar o
+repositório com estes ficheiros antes de o executar, ou ajustar o bloco de
+importação para utilizar os ficheiros carregados na sessão Colab.
+Localmente: pip install pandas matplotlib; python test_validacao.py.
 
-DESCRIÇÃO:
-Este projeto tem como objetivo desenvolver um agente de Inteligência Artificial capaz de planear e otimizar rotas de recolha e entrega de produtos alimentares locais.
-
-O problema considera dois veículos, produtores, clientes e locais de entrega, procurando minimizar a distância total percorrida e respeitar as restrições de capacidade dos veículos, precedência entre recolhas e entregas e janelas temporais.
-
-ALGORITMOS IMPLEMENTADOS:
-- Greedy construtivo, com duas heurísticas.
-- Greedy Best-First Search (GBFS), com duas heurísticas.
-- A*, com duas heurísticas.
-- Hill Climbing, para otimização local de soluções completas.
-- Constraint Satisfaction Problem (CSP), para obtenção de soluções viáveis.
-
-ESTRUTURA DO PROJETO:
-- 01_eda_tiny.ipynb — Análise Exploratória dos Dados.
-- 02_relatorio.ipynb — Relatório, execução experimental, gráficos e conclusões.
-- algoritmos.py — Modelação do problema e implementação dos algoritmos.
-- data_tiny/ — Dataset utilizado, constituído por 11 ficheiros CSV.
-- readme.txt — Descrição do projeto e ligação ao repositório.
-
-EXECUÇÃO:
-1. Abrir o notebook 02_relatorio.ipynb no Google Colab.
-2. Garantir acesso ao repositório privado do GitHub e configurar o segredo GITHUB_TOKEN no Colab, caso se utilize a importação automática do repositório.
-3. Executar as células do notebook pela ordem apresentada.
-4. Consultar os resultados experimentais dos cenários com 3, 5 e 11 artigos.
-
-Os resultados incluem tabelas comparativas, tempos de execução, número de nós expandidos, distâncias percorridas e gráficos de evolução do Hill Climbing.
-
-NOTEBOOKS NO GOOGLE COLAB:
-EDA:
-https://colab.research.google.com/drive/12FWaIvBdJSoylMhv3waKl_61A0MqUpJT
-
-RELATÓRIO:
-https://colab.research.google.com/drive/1weJqQm-Yb1vAAoeTRzOOaSqEdxYfGAa-
-
-NOTAS:
-- O dataset utilizado é o data_tiny.
-- Os algoritmos de pesquisa utilizam limites computacionais.
-- Não é garantida a otimalidade global das soluções obtidas.
-- O Hill Climbing utiliza uma solução completa da GBFS quando disponível; caso contrário, pode utilizar uma solução do CSP.
+LIMITAÇÕES
+O A* tem limite de expansões e não garante ótimo quando interrompido.
+H1 do A* equivale a custo uniforme; H2 usa heurística de distância.
+Hill Climbing exige solução inicial Greedy completa.
+Os textos de resultados históricos no notebook devem ser atualizados após
+nova execução integral; não devem ser apresentados como resultados novos.
+O dataset completo de 80 artigos não teve solução completa confirmada.
