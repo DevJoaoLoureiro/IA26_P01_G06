@@ -1,7 +1,7 @@
-"""Projeto IA26_P01_G18 — algoritmos de rotas (instância data_tiny).
+"""Projeto IA26_P01_G18 — algoritmos de rotas (datasets data_tiny e data_small).
 
-Modelo: cada artigo é uma tarefa pickup/delivery; um veículo parte do centro,
-respeita janelas, precedência e carga, e regressa ao centro.
+Modelo: recolha -> centro -> entrega, com capacidade e retorno ao centro.
+CSP respeita janelas temporais; A* ignora-as por opção de modelação.
 A data da encomenda é considerada a primeira data permitida para recolha.
 Inclui as abordagens para um veículo e para frota de dois veículos.
 Os algoritmos de pesquisa usam limites e não garantem otimalidade global.
@@ -42,6 +42,9 @@ class Problem:
     duration: dict[tuple[int,int],float]
     start_time: pd.Timestamp
     rejected: list[tuple[int,str]] = field(default_factory=list)
+    stop_service_min: float = 0.0
+    warehouse_handling_min: float = 0.0
+    horizon_end: pd.Timestamp | None = None
 
 @dataclass
 class State:
@@ -52,6 +55,7 @@ class State:
     delivered: frozenset[int] = frozenset()
     route: tuple[tuple[str,int,int,str],...] = ()
     km: float = 0.0
+    warehouse_passed: frozenset[int] = frozenset()
 
 @dataclass
 class Result:
@@ -72,6 +76,19 @@ def load_problem(folder="data", vehicle_id=1, start_time=None):
     names = ["orders", "order_items", "products", "producers", "vehicles",
              "locations", "distance_matrix"]
     data = {name: pd.read_csv(folder / f"{name}.csv") for name in names}
+    rules = {}
+    rules_file = folder / "rules.csv"
+    if rules_file.exists():
+        rules = dict(pd.read_csv(rules_file).loc[:, ["rule", "value"]].values)
+    stop_min = float(rules.get("stop_service_min", 0))
+    handling_min = float(rules.get("warehouse_handling_min", 0))
+    # O descarregamento e carregamento ocorrem na mesma visita ao centro.
+    # Por isso, a permanência em armazém é 0h (<= max_warehouse_dwell_h).
+    if rules and rules.get("flow") != "producer>warehouse>delivery_location":
+        raise ValueError("Fluxo logístico desconhecido em rules.csv")
+    horizon_end = None
+    if "start_date" in rules and "horizon_days" in rules:
+        horizon_end = pd.Timestamp(rules["start_date"]) + pd.Timedelta(days=int(rules["horizon_days"]))
     locs = data["locations"]
     def locate(kind, ref):
         rows = locs[(locs.location_type == kind) & (locs.ref_id == ref)]
@@ -94,10 +111,12 @@ def load_problem(folder="data", vehicle_id=1, start_time=None):
         pickup_end = pd.Timestamp(r.availability_end)
         delivery_start = pd.Timestamp(r.delivery_start)
         delivery_end = pd.Timestamp(r.delivery_end)
-        weight = float(r.quantity) * float(product.unit_weight_kg)
+        weight = float(r.weight_kg) if "weight_kg" in r._fields else float(r.quantity) * float(product.unit_weight_kg)
         item_id = int(r.order_item_id)
+        # Seleção comum de artigos temporalmente elegíveis para comparação justa.
+        # A* ignora as janelas durante a procura, mas usa a mesma instância.
         if pickup_end < ready:
-            rejected.append((item_id, "recolha termina antes de a encomenda poder ser recolhida"))
+            rejected.append((item_id, "janela de recolha impossível"))
             continue
         if delivery_end < ready or delivery_end < delivery_start:
             rejected.append((item_id, "janela de entrega impossível"))
@@ -115,7 +134,7 @@ def load_problem(folder="data", vehicle_id=1, start_time=None):
            for r in data["distance_matrix"].itertuples(index=False)}
     if start_time is None:
         start_time = min((r.ready for r in requests), default=pd.Timestamp.now())
-    return Problem(vehicle, requests, dist, dur, pd.Timestamp(start_time), rejected)
+    return Problem(vehicle, requests, dist, dur, pd.Timestamp(start_time), rejected, stop_min, handling_min, horizon_end)
 
 
 def travel(problem, origin, destination):
@@ -128,84 +147,117 @@ def initial(problem):
     return State(problem.vehicle.center_location, problem.start_time)
 
 
-def actions(problem, state):
-    """Transições viáveis; espera até ao início da janela, quando necessário."""
+def _service_end(problem, service_start, kind, check_time_windows):
+    """Regista o início de serviço na rota; atualiza o relógio após o serviço."""
+    minutes = (problem.warehouse_handling_min if kind == "armazem"
+               else problem.stop_service_min)
+    end = service_start + pd.Timedelta(minutes=minutes)
+    if check_time_windows and problem.horizon_end is not None and end > problem.horizon_end:
+        return None
+    return end
+
+
+def actions(problem, state, check_time_windows=True):
+    """Uma visita ao armazém descarrega/recarrega todos os artigos a bordo.
+
+    Modelo sem armazenamento entre visitas: permanência de cada artigo no
+    centro = 0 horas. A carga mantém-se a bordo no estado agregado.
+    A hora na rota é o INÍCIO do serviço (regra window_semantics).
+    """
+    center = problem.vehicle.center_location
+    pending = state.picked - state.warehouse_passed
+    if pending:
+        km, minutes = travel(problem, state.location, center)
+        arrival = state.moment + pd.Timedelta(minutes=minutes)
+        end = _service_end(problem, arrival, "armazem", check_time_windows)
+        if end is not None:
+            yield State(center, end, state.load, state.picked, state.delivered,
+                        state.route + (("armazem", 0, center, str(arrival)),),
+                        state.km + km, state.warehouse_passed | pending)
     for req in problem.requests:
-        if req.item_id not in state.picked:
+        item = req.item_id
+        if item not in state.picked:
             if state.load + req.weight > problem.vehicle.capacity_kg + 1e-9:
                 continue
-            km, minutes = travel(problem, state.location, req.pickup)
-            arrival = state.moment + pd.Timedelta(minutes=minutes)
-            arrival = max(arrival, req.ready)
-            if arrival > req.pickup_end:
+            loc, kind, delta, earliest, latest = req.pickup, "recolha", req.weight, req.ready, req.pickup_end
+        elif item in state.warehouse_passed and item not in state.delivered:
+            loc, kind, delta, earliest, latest = req.delivery, "entrega", -req.weight, req.delivery_start, req.delivery_end
+        else:
+            continue
+        km, minutes = travel(problem, state.location, loc)
+        arrival = state.moment + pd.Timedelta(minutes=minutes)
+        if check_time_windows:
+            arrival = max(arrival, earliest)
+            if arrival > latest:
                 continue
-            yield State(req.pickup, arrival, state.load + req.weight,
-                state.picked | {req.item_id}, state.delivered,
-                state.route + (("recolha", req.item_id, req.pickup, str(arrival)),), state.km + km)
-        elif req.item_id not in state.delivered:
-            km, minutes = travel(problem, state.location, req.delivery)
-            arrival = max(state.moment + pd.Timedelta(minutes=minutes), req.delivery_start)
-            if arrival > req.delivery_end:
-                continue
-            yield State(req.delivery, arrival, max(0.0,state.load - req.weight),
-                state.picked, state.delivered | {req.item_id},
-                state.route + (("entrega", req.item_id, req.delivery, str(arrival)),), state.km + km)
+        end = _service_end(problem, arrival, kind, check_time_windows)
+        if end is None:
+            continue
+        yield State(loc, end, max(0., state.load + delta),
+                    state.picked | ({item} if kind == "recolha" else set()),
+                    state.delivered | ({item} if kind == "entrega" else set()),
+                    state.route + ((kind, item, loc, str(arrival)),),
+                    state.km + km, state.warehouse_passed)
 
 
 def finish(problem, state):
     km, minutes = travel(problem, state.location, problem.vehicle.center_location)
     arrival = state.moment + pd.Timedelta(minutes=minutes)
     return State(problem.vehicle.center_location, arrival, state.load,
-        state.picked, state.delivered,
-        state.route + (("regresso", 0, problem.vehicle.center_location, str(arrival)),), state.km + km)
+                 state.picked, state.delivered,
+                 state.route + (("regresso", 0, problem.vehicle.center_location, str(arrival)),),
+                 state.km + km, state.warehouse_passed)
 
 
 def heuristic(problem, state, variant=1):
-    """h1: menor distância até uma ação pendente; h2: maior distância até uma ação pendente.
-    Heurísticas informativas, não garantidamente admissíveis para A*."""
+    """Limites inferiores em km; H1=0, H2=distância mínima à próxima ação.
+
+    O custo de regressar ao centro é incluído quando não restam artigos.
+    """
+    if variant not in (1, 2):
+        raise ValueError("heuristic_variant deve ser 1 ou 2")
+    if variant == 1:
+        return 0.0
     targets = []
+    if state.picked - state.warehouse_passed:
+        targets.append(problem.vehicle.center_location)
     for req in problem.requests:
         if req.item_id not in state.picked:
             targets.append(req.pickup)
-        elif req.item_id not in state.delivered:
+        elif req.item_id in state.warehouse_passed and req.item_id not in state.delivered:
             targets.append(req.delivery)
     if not targets:
-        return travel(problem,state.location,problem.vehicle.center_location)[0]
-    values = [travel(problem,state.location,x)[0] for x in targets]
-    return min(values) if variant == 1 else max(values)
+        return travel(problem, state.location, problem.vehicle.center_location)[0]
+    return min(travel(problem, state.location, loc)[0] for loc in targets)
 
 
 def search(problem, method="astar", heuristic_variant=1, max_expansions=50000):
-    """Procura no espaço de tarefas de um único veículo. A* sem garantia de otimalidade
-    com estas heurísticas. Se não houver solução, devolve resultado inviável."""
+    """A* e GBFS de um veículo sem restrições horárias; custo em km."""
     start = time.perf_counter()
     counter = itertools.count()
     root = initial(problem)
-    heap = [(heuristic(problem,root,heuristic_variant),next(counter),root)]
+    heap = [(heuristic(problem, root, heuristic_variant), next(counter), root)]
     expanded = 0
     best = {}
     n = len(problem.requests)
     while heap and expanded < max_expansions:
-        _,_,state = heapq.heappop(heap)
+        _, _, state = heapq.heappop(heap)
         if len(state.delivered) == n:
-            done = finish(problem,state)
+            done = finish(problem, state)
             return Result(method, True, done.km, expanded, time.perf_counter()-start,
                           list(done.route), n, n)
-        key = (state.location,state.picked,state.delivered,
-               round(state.load,5))
-        # Dominância: menor distância e chegada não posterior.
-        previous = best.get(key, [])
-        if any(k <= state.km + 1e-9 and t <= state.moment for k,t in previous):
+        key = (state.location, state.picked, state.warehouse_passed,
+               state.delivered, round(state.load, 5))
+        if best.get(key, math.inf) <= state.km + 1e-9:
             continue
-        best[key] = [(k,t) for k,t in previous
-                     if not (state.km <= k + 1e-9 and state.moment <= t)] + [(state.km,state.moment)]
+        best[key] = state.km
         expanded += 1
-        for nxt in actions(problem,state):
-            h = heuristic(problem,nxt,heuristic_variant)
+        for nxt in actions(problem, state, check_time_windows=False):
+            h = heuristic(problem, nxt, heuristic_variant)
             priority = h if method == "greedy" else nxt.km + h
-            heapq.heappush(heap,(priority,next(counter),nxt))
-    return Result(method,False,math.inf,expanded,time.perf_counter()-start,
-                  [],0,n,"Sem solução completa ou limite de expansões atingido")
+            heapq.heappush(heap, (priority, next(counter), nxt))
+    return Result(method, False, math.inf, expanded, time.perf_counter()-start,
+                  [], 0, n, "Sem solução completa ou limite de expansões atingido")
 
 
 def greedy(problem, heuristic_variant=1, max_expansions=50000):
@@ -218,20 +270,19 @@ def astar(problem, heuristic_variant=1, max_expansions=50000):
     return search(problem,"astar",heuristic_variant,max_expansions)
 
 
-def evaluate_sequence(problem, sequence):
-    """Avalia uma sequência fixa de ('recolha'|'entrega', item_id)."""
+def evaluate_sequence(problem, sequence, check_time_windows=False):
+    """Avalia uma sequência fixa de (recolha|armazem|entrega, artigo)."""
     state = initial(problem)
-    lookup = {r.item_id:r for r in problem.requests}
     for kind, item in sequence:
-        options = list(actions(problem,state))
+        options = actions(problem, state, check_time_windows=check_time_windows)
         found = next((s for s in options if s.route[-1][0] == kind and
-                      s.route[-1][1] == item),None)
+                      s.route[-1][1] == item), None)
         if found is None:
             return None
         state = found
     if len(state.delivered) != len(problem.requests):
         return None
-    return finish(problem,state)
+    return finish(problem, state)
 
 
 def hill_climbing(problem, initial_result, max_iterations=200):
@@ -309,6 +360,9 @@ class FleetProblem:
     duration: dict
     start_time: pd.Timestamp
     rejected: list[tuple[int,str]] = field(default_factory=list)
+    stop_service_min: float = 0.0
+    warehouse_handling_min: float = 0.0
+    horizon_end: pd.Timestamp | None = None
 
 @dataclass
 class FleetResult:
@@ -339,40 +393,56 @@ def load_fleet_problem(folder="data", start_time=None):
             raise ValueError(f"Centro não encontrado para veículo {v.vehicle_id}")
         vehicles.append(Vehicle(int(v.vehicle_id), float(v.capacity_kg), int(rows.iloc[0].location_id)))
     return FleetProblem(vehicles, base.requests, base.distance, base.duration,
-                        base.start_time, base.rejected)
+                        base.start_time, base.rejected, base.stop_service_min,
+                        base.warehouse_handling_min, base.horizon_end)
 
 
-def _fleet_candidates(problem, states, item_ids):
-    """Gera recolhas/entregas viáveis para cada carrinha; cada artigo só pertence a uma."""
-    lookup = {r.item_id:r for r in problem.requests}
+def _fleet_candidates(problem, states, item_ids, check_time_windows=True):
+    """Gera ações de dois veículos, com serviço, janelas e armazém."""
+    lookup = {r.item_id: r for r in problem.requests}
     for vi, state in enumerate(states):
         vehicle = problem.vehicles[vi]
-        for item in item_ids:
+        pending = state.picked - state.warehouse_passed
+        if pending:
+            loc = vehicle.center_location
+            km = 0. if state.location == loc else problem.distance[(state.location, loc)]
+            minutes = 0. if state.location == loc else problem.duration[(state.location, loc)]
+            arrival = state.moment + pd.Timedelta(minutes=minutes)
+            end = _service_end(problem, arrival, "armazem", check_time_windows)
+            if end is not None:
+                nxt = State(loc, end, state.load, state.picked, state.delivered,
+                            state.route + (("armazem", 0, loc, str(arrival)),),
+                            state.km + km, state.warehouse_passed | pending)
+                yield vi, nxt, km, "armazem", 0
+        for item in sorted(item_ids):
             r = lookup[item]
-            # item já recolhido por outro veículo: não pode mudar de carrinha
-            owner = next((i for i,s in enumerate(states) if item in s.picked), None)
+            owner = next((i for i, s in enumerate(states) if item in s.picked), None)
             if owner is None:
                 if state.load + r.weight > vehicle.capacity_kg + 1e-9:
                     continue
-                loc, kind = r.pickup, "recolha"
-                window_start, window_end = r.ready, r.pickup_end
-                delta_load = r.weight
-            elif owner == vi and item not in state.delivered:
-                loc, kind = r.delivery, "entrega"
-                window_start, window_end = r.delivery_start, r.delivery_end
-                delta_load = -r.weight
+                loc, kind, delta = r.pickup, "recolha", r.weight
+                earliest, latest = r.ready, r.pickup_end
+            elif owner == vi and item in state.warehouse_passed and item not in state.delivered:
+                loc, kind, delta = r.delivery, "entrega", -r.weight
+                earliest, latest = r.delivery_start, r.delivery_end
             else:
                 continue
-            km = 0.0 if state.location == loc else problem.distance[(state.location,loc)]
-            minutes = 0.0 if state.location == loc else problem.duration[(state.location,loc)]
-            arrival = max(state.moment + pd.Timedelta(minutes=minutes), window_start)
-            if arrival > window_end:
+            km = 0. if state.location == loc else problem.distance[(state.location, loc)]
+            minutes = 0. if state.location == loc else problem.duration[(state.location, loc)]
+            arrival = state.moment + pd.Timedelta(minutes=minutes)
+            if check_time_windows:
+                arrival = max(arrival, earliest)
+                if arrival > latest:
+                    continue
+            end = _service_end(problem, arrival, kind, check_time_windows)
+            if end is None:
                 continue
-            nxt = State(loc, arrival, max(0.,state.load + delta_load),
-                        state.picked | ({item} if kind == 'recolha' else set()),
-                        state.delivered | ({item} if kind == 'entrega' else set()),
-                        state.route + ((kind,item,loc,str(arrival)),),state.km+km)
-            yield vi,nxt,km,kind,item
+            nxt = State(loc, end, max(0., state.load + delta),
+                        state.picked | ({item} if kind == "recolha" else set()),
+                        state.delivered | ({item} if kind == "entrega" else set()),
+                        state.route + ((kind, item, loc, str(arrival)),),
+                        state.km + km, state.warehouse_passed)
+            yield vi, nxt, km, kind, item
 
 
 def _fleet_complete(problem, states, delivered_count, expanded, start, algorithm, message=""):
@@ -411,7 +481,7 @@ def fleet_greedy(problem, heuristic_variant=1, max_steps=10000):
         elif heuristic_variant == 2:
             lookup = {r.item_id:r for r in problem.requests}
             selected = min(candidates,key=lambda c:(
-                (lookup[c[4]].pickup_end if c[3]=='recolha' else lookup[c[4]].delivery_end)-c[1].moment,
+                (lookup[c[4]].pickup_end if c[3]=='recolha' else lookup[c[4]].delivery_end)-c[1].moment if c[3] != "armazem" else pd.Timedelta(hours=48),
                 c[2],c[0]))
         else:
             raise ValueError("heuristic_variant deve ser 1 ou 2")
@@ -456,6 +526,7 @@ def fleet_gbfs(problem, heuristic_variant=1, max_expansions=5000):
         return min(
             ((by_id[item].pickup_end if kind == 'recolha'
               else by_id[item].delivery_end) - nxt.moment).total_seconds() / 60.0
+            if kind != "armazem" else 0.0
             for _, nxt, _, kind, item in candidates
         )
 
@@ -473,7 +544,7 @@ def fleet_gbfs(problem, heuristic_variant=1, max_expansions=5000):
         if completed == ids:
             return _fleet_complete(problem, states, len(completed),
                                    expanded, start, "fleet_gbfs")
-        key = tuple((s.location, s.picked, s.delivered,
+        key = tuple((s.location, s.picked, s.warehouse_passed, s.delivered,
                      round(s.load, 5), s.moment) for s in states)
         if key in visited:
             continue
@@ -513,12 +584,12 @@ def fleet_astar(problem, heuristic_variant=1, max_expansions=10000):
             best_partial=states
         if delivered==ids:
             return _fleet_complete(problem,states,len(delivered),expanded,start,"fleet_astar")
-        key=tuple((s.location,s.picked,s.delivered,round(s.load,5),s.moment) for s in states)
+        key=tuple((s.location,s.picked,s.warehouse_passed,s.delivered,round(s.load,5)) for s in states)
         if key in seen:
             continue
         seen.add(key)
         expanded+=1
-        for vi,nxt,km,kind,item in _fleet_candidates(problem,states,ids-delivered):
+        for vi,nxt,km,kind,item in _fleet_candidates(problem,states,ids-delivered,check_time_windows=False):
             new_states=tuple(nxt if j==vi else s for j,s in enumerate(states))
             cost=sum(s.km for s in new_states)
             remaining=len(ids)-len(frozenset().union(*(s.delivered for s in new_states)))
@@ -537,7 +608,8 @@ def fleet_astar(problem, heuristic_variant=1, max_expansions=10000):
                         _fleet_candidates(
                             problem,
                             new_states,
-                            pendentes
+                            pendentes,
+                            check_time_windows=False
                         )
                     )
 
@@ -571,46 +643,19 @@ def fleet_summary(results):
 # ================== HILL CLIMBING E CSP PARA A FROTA ==================
 
 def evaluate_fleet_sequences(problem, sequences):
-    """Simula rotas fixas dos veículos e devolve FleetResult se forem válidas."""
+    """Valida rotas completas com recolha, passagem pelo centro e entrega."""
     start = time.perf_counter()
     by_id = {r.item_id: r for r in problem.requests}
-    states = [State(v.center_location, problem.start_time)
-              for v in problem.vehicles]
-    used = set()
+    states = [State(v.center_location, problem.start_time) for v in problem.vehicles]
     for vi, sequence in enumerate(sequences):
-        vehicle = problem.vehicles[vi]
-        state = states[vi]
         for kind, item in sequence:
-            if item not in by_id or kind not in ("recolha", "entrega"):
+            options = _fleet_candidates(problem, tuple(states), set(by_id),
+                                        check_time_windows=True)
+            found = next((nxt for j, nxt, _, action, article in options
+                          if j == vi and action == kind and article == item), None)
+            if found is None:
                 return None
-            req = by_id[item]
-            owner = next((j for j, s in enumerate(states)
-                          if item in s.picked), None)
-            if kind == "recolha":
-                if owner is not None or item in used:
-                    return None
-                if state.load + req.weight > vehicle.capacity_kg + 1e-9:
-                    return None
-                loc, earliest, latest = req.pickup, req.ready, req.pickup_end
-                load = state.load + req.weight
-            else:
-                if owner != vi or item in state.delivered:
-                    return None
-                loc, earliest, latest = (req.delivery, req.delivery_start,
-                                         req.delivery_end)
-                load = state.load - req.weight
-            km = 0 if loc == state.location else problem.distance[(state.location,loc)]
-            minutes = 0 if loc == state.location else problem.duration[(state.location,loc)]
-            moment = max(state.moment + pd.Timedelta(minutes=minutes), earliest)
-            if moment > latest:
-                return None
-            state = State(loc, moment, load,
-                          state.picked | ({item} if kind == "recolha" else set()),
-                          state.delivered | ({item} if kind == "entrega" else set()),
-                          state.route + ((kind,item,loc,str(moment)),), state.km + km)
-            states[vi] = state
-            if kind == "recolha":
-                used.add(item)
+            states[vi] = found
     done = set().union(*(s.delivered for s in states))
     if done != set(by_id):
         return None
@@ -717,6 +762,36 @@ def fleet_csp(problem, max_nodes=50000):
                            f"backtracks={backtracks}")
 
 
+def validar_passagem_centro(rotas, centers=None, expected_items=None):
+    """Confirma recolha -> centro -> entrega em cada rota.
+
+    centers: mapeamento vehicle_id -> location_id, para verificar a localização.
+    expected_items: conjunto de artigos que devem ser entregues exatamente uma vez.
+    """
+    delivered_global = set()
+    for vehicle_id, route in rotas.items():
+        picked = set()
+        passed = set()
+        for kind, item, loc, _ in route:
+            if kind == "recolha":
+                if item in picked or item in delivered_global:
+                    return False
+                picked.add(item)
+            elif kind == "armazem":
+                if centers is not None and loc != centers[vehicle_id]:
+                    return False
+                passed.update(picked)
+            elif kind == "entrega":
+                if item not in passed or item in delivered_global:
+                    return False
+                delivered_global.add(item)
+            elif kind != "regresso":
+                return False
+    if expected_items is not None and delivered_global != set(expected_items):
+        return False
+    return True
+
+
 if __name__ == "__main__":
     p = load_fleet_problem("data")
     p.requests = p.requests[:3]
@@ -725,3 +800,5 @@ if __name__ == "__main__":
     h = fleet_hill_climbing(p, a if a.feasible else g)
     c = fleet_csp(p, max_nodes=2000)
     print(fleet_summary([g,a,h,c]).to_string(index=False))
+
+
