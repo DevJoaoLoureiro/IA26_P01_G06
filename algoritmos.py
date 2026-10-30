@@ -1,4 +1,4 @@
-"""Projeto IA26_P01_G18 — algoritmos de rotas (datasets data_tiny e data_small).
+"""Projeto IA26_P01_G06 — algoritmos de rotas (datasets data_tiny e data_small).
 
 Modelo: recolha -> centro -> entrega, com capacidade e retorno ao centro.
 CSP e A* respeitam as janelas temporais na procura da frota.
@@ -157,6 +157,36 @@ def _service_end(problem, service_start, kind, check_time_windows):
     return end
 
 
+def _move(problem, state, loc, kind, earliest=None, latest=None,
+          check_time_windows=True):
+    """Calcula (km, início do serviço, fim do serviço) de uma operação.
+
+    O tempo de serviço (stop_service_min) é contado por PARAGEM, como indica
+    rules.csv: operações consecutivas do mesmo tipo no mesmo local juntam-se à
+    paragem em curso, sem novo tempo de serviço, desde que o início dessa
+    paragem respeite a janela do artigo. Devolve None se a operação é inviável.
+    """
+    if state.route:
+        last_kind, _, last_loc, last_start = state.route[-1]
+        if (kind in ("recolha", "entrega") and last_kind == kind
+                and last_loc == loc and state.location == loc):
+            stop_start = pd.Timestamp(last_start)
+            if (not check_time_windows or
+                    (earliest is None or stop_start >= earliest) and
+                    (latest is None or stop_start <= latest)):
+                return 0.0, stop_start, state.moment
+    km, minutes = travel(problem, state.location, loc)
+    arrival = state.moment + pd.Timedelta(minutes=minutes)
+    if check_time_windows and earliest is not None:
+        arrival = max(arrival, earliest)
+    if check_time_windows and latest is not None and arrival > latest:
+        return None
+    end = _service_end(problem, arrival, kind, check_time_windows)
+    if end is None:
+        return None
+    return km, arrival, end
+
+
 def actions(problem, state, check_time_windows=True):
     """Uma visita ao armazém descarrega/recarrega todos os artigos a bordo.
 
@@ -167,10 +197,10 @@ def actions(problem, state, check_time_windows=True):
     center = problem.vehicle.center_location
     pending = state.picked - state.warehouse_passed
     if pending:
-        km, minutes = travel(problem, state.location, center)
-        arrival = state.moment + pd.Timedelta(minutes=minutes)
-        end = _service_end(problem, arrival, "armazem", check_time_windows)
-        if end is not None:
+        step = _move(problem, state, center, "armazem",
+                     check_time_windows=check_time_windows)
+        if step is not None:
+            km, arrival, end = step
             yield State(center, end, state.load, state.picked, state.delivered,
                         state.route + (("armazem", 0, center, str(arrival)),),
                         state.km + km, state.warehouse_passed | pending)
@@ -184,15 +214,10 @@ def actions(problem, state, check_time_windows=True):
             loc, kind, delta, earliest, latest = req.delivery, "entrega", -req.weight, req.delivery_start, req.delivery_end
         else:
             continue
-        km, minutes = travel(problem, state.location, loc)
-        arrival = state.moment + pd.Timedelta(minutes=minutes)
-        if check_time_windows:
-            arrival = max(arrival, earliest)
-            if arrival > latest:
-                continue
-        end = _service_end(problem, arrival, kind, check_time_windows)
-        if end is None:
+        step = _move(problem, state, loc, kind, earliest, latest, check_time_windows)
+        if step is None:
             continue
+        km, arrival, end = step
         yield State(loc, end, max(0., state.load + delta),
                     state.picked | ({item} if kind == "recolha" else set()),
                     state.delivered | ({item} if kind == "entrega" else set()),
@@ -375,6 +400,7 @@ class FleetResult:
     delivered: int
     total: int
     message: str = ""
+    history: list = field(default_factory=list)
 
 
 def load_fleet_problem(folder="data", start_time=None):
@@ -405,11 +431,10 @@ def _fleet_candidates(problem, states, item_ids, check_time_windows=True):
         pending = state.picked - state.warehouse_passed
         if pending:
             loc = vehicle.center_location
-            km = 0. if state.location == loc else problem.distance[(state.location, loc)]
-            minutes = 0. if state.location == loc else problem.duration[(state.location, loc)]
-            arrival = state.moment + pd.Timedelta(minutes=minutes)
-            end = _service_end(problem, arrival, "armazem", check_time_windows)
-            if end is not None:
+            step = _move(problem, state, loc, "armazem",
+                         check_time_windows=check_time_windows)
+            if step is not None:
+                km, arrival, end = step
                 nxt = State(loc, end, state.load, state.picked, state.delivered,
                             state.route + (("armazem", 0, loc, str(arrival)),),
                             state.km + km, state.warehouse_passed | pending)
@@ -427,22 +452,69 @@ def _fleet_candidates(problem, states, item_ids, check_time_windows=True):
                 earliest, latest = r.delivery_start, r.delivery_end
             else:
                 continue
-            km = 0. if state.location == loc else problem.distance[(state.location, loc)]
-            minutes = 0. if state.location == loc else problem.duration[(state.location, loc)]
-            arrival = state.moment + pd.Timedelta(minutes=minutes)
-            if check_time_windows:
-                arrival = max(arrival, earliest)
-                if arrival > latest:
-                    continue
-            end = _service_end(problem, arrival, kind, check_time_windows)
-            if end is None:
+            step = _move(problem, state, loc, kind, earliest, latest,
+                         check_time_windows)
+            if step is None:
                 continue
+            km, arrival, end = step
             nxt = State(loc, end, max(0., state.load + delta),
                         state.picked | ({item} if kind == "recolha" else set()),
                         state.delivered | ({item} if kind == "entrega" else set()),
                         state.route + ((kind, item, loc, str(arrival)),),
                         state.km + km, state.warehouse_passed)
             yield vi, nxt, km, kind, item
+
+
+def _fleet_dead_end(problem, states):
+    """Forward checking: True se algum artigo pendente já não pode ser entregue.
+
+    Para cada artigo calcula um limite otimista (ignora os restantes artigos e
+    a ocupação do veículo com outras tarefas). Se nem esse caso otimista cumpre
+    as janelas, o estado é um beco sem saída e pode ser podado.
+    """
+    svc = pd.Timedelta(minutes=problem.stop_service_min)
+    hand = pd.Timedelta(minutes=problem.warehouse_handling_min)
+    dur = problem.duration
+
+    def t(a, b):
+        return pd.Timedelta(minutes=0.0 if a == b else dur[(a, b)])
+
+    owner = {}
+    for vi, s in enumerate(states):
+        for item in s.picked:
+            owner[item] = vi
+    for r in problem.requests:
+        vi = owner.get(r.item_id)
+        if vi is None:
+            ok = False
+            for v, s in zip(problem.vehicles, states):
+                if r.weight > v.capacity_kg + 1e-9:
+                    continue
+                start = max(s.moment + t(s.location, r.pickup)
+                            - (svc if s.location == r.pickup else pd.Timedelta(0)),
+                            r.ready)
+                if start > r.pickup_end:
+                    continue
+                arrive = (start + svc + t(r.pickup, v.center_location) + hand
+                          + t(v.center_location, r.delivery))
+                if max(arrive, r.delivery_start) <= r.delivery_end:
+                    ok = True
+                    break
+            if not ok:
+                return True
+            continue
+        s, v = states[vi], problem.vehicles[vi]
+        if r.item_id in s.delivered:
+            continue
+        if r.item_id in s.warehouse_passed:
+            arrive = (s.moment + t(s.location, r.delivery)
+                      - (svc if s.location == r.delivery else pd.Timedelta(0)))
+        else:
+            arrive = (s.moment + t(s.location, v.center_location) + hand
+                      + t(v.center_location, r.delivery))
+        if max(arrive, r.delivery_start) > r.delivery_end:
+            return True
+    return False
 
 
 def _fleet_complete(problem, states, delivered_count, expanded, start, algorithm, message=""):
@@ -477,7 +549,10 @@ def fleet_greedy(problem, heuristic_variant=1, max_steps=10000):
             return _fleet_complete(problem,states,len(delivered),expanded,start,"fleet_greedy",
                                    "Sem próximas ações válidas; solução parcial")
         if heuristic_variant == 1:
-            selected = min(candidates,key=lambda c:(c[2],c[1].moment, c[0]))
+            # Escolhe a operação que termina mais cedo (inclui esperas) e,
+            # em empate, a mais curta. Usar só os km ignorava as esperas e
+            # levava a recolher artigos do dia seguinte demasiado cedo.
+            selected = min(candidates,key=lambda c:(c[1].moment, c[2], c[0]))
         elif heuristic_variant == 2:
             lookup = {r.item_id:r for r in problem.requests}
             selected = min(candidates,key=lambda c:(
@@ -491,7 +566,8 @@ def fleet_greedy(problem, heuristic_variant=1, max_steps=10000):
     return _fleet_complete(problem,states,len(delivered),expanded,start,"fleet_greedy","Limite de passos")
 
 
-def fleet_gbfs(problem, heuristic_variant=1, max_expansions=5000):
+def fleet_gbfs(problem, heuristic_variant=1, max_expansions=5000,
+               forward_checking=False):
     """Greedy Best-First Search para a frota, com fronteira de prioridades.
 
     A fronteira é ordenada APENAS por h(n), sem incluir g(n):
@@ -553,6 +629,8 @@ def fleet_gbfs(problem, heuristic_variant=1, max_expansions=5000):
         for vi, nxt, _, _, _ in _fleet_candidates(problem, states, ids - completed):
             successors = tuple(nxt if j == vi else s
                                for j, s in enumerate(states))
+            if forward_checking and _fleet_dead_end(problem, successors):
+                continue  # poda: algum artigo já não pode ser entregue
             heapq.heappush(frontier, (h(successors), next(counter), successors))
 
     partial_count = len(delivered_ids(best_partial))
@@ -565,7 +643,8 @@ def fleet_gbfs(problem, heuristic_variant=1, max_expansions=5000):
 
 
 
-def fleet_astar(problem, heuristic_variant=1, max_expansions=10000):
+def fleet_astar(problem, heuristic_variant=1, max_expansions=10000,
+                forward_checking=False):
     """A* para dois veículos, respeitando capacidade, precedência e horários.
 
     H1: limite inferior 0 (custo uniforme, admissível).
@@ -616,6 +695,8 @@ def fleet_astar(problem, heuristic_variant=1, max_expansions=10000):
         for vi, nxt, _, _, _ in _fleet_candidates(problem, states, ids - delivered,
                                                   check_time_windows=True):
             successors = tuple(nxt if j == vi else s for j, s in enumerate(states))
+            if forward_checking and _fleet_dead_end(problem, successors):
+                continue  # poda: algum artigo já não pode ser entregue
             g = sum(s.km for s in successors)
             heapq.heappush(queue, (g + heuristic(successors), next(counter), successors))
     delivered = delivered_ids(best_partial)
@@ -698,14 +779,14 @@ def evaluate_fleet_sequences(problem, sequences):
                            "fleet_evaluation")
 
 
-def fleet_hill_climbing(problem, initial_result, max_iterations=100):
+def fleet_hill_climbing_trocas(problem, initial_result, max_iterations=100):
     """Trocas de operações e realocações entre veículos; preserva viabilidade.
     history regista o custo após cada iteração para os gráficos do relatório.
     """
     start = time.perf_counter()
     count = len(problem.requests)
     if not initial_result.feasible:
-        return FleetResult("fleet_hill_climbing", False, math.inf, 0,
+        return FleetResult("fleet_hill_climbing_trocas", False, math.inf, 0,
                            time.perf_counter()-start, {}, 0, count,
                            "É necessária uma solução inicial completa")
     sequences = [
@@ -715,7 +796,7 @@ def fleet_hill_climbing(problem, initial_result, max_iterations=100):
     ]
     current = evaluate_fleet_sequences(problem, sequences)
     if current is None:
-        return FleetResult("fleet_hill_climbing", False, math.inf, 0,
+        return FleetResult("fleet_hill_climbing_trocas", False, math.inf, 0,
                            time.perf_counter()-start, {}, 0, count,
                            "A rota inicial não passou na validação")
     history = [current.distance_km]
@@ -750,14 +831,14 @@ def fleet_hill_climbing(problem, initial_result, max_iterations=100):
             break
         sequences, current = best_sequences, best
         history.append(current.distance_km)
-    current.algorithm = "fleet_hill_climbing"
+    current.algorithm = "fleet_hill_climbing_trocas"
     current.expanded = iterations
     current.runtime_s = time.perf_counter()-start
     current.history = history
     return current
 
 
-def fleet_csp(problem, max_nodes=50000):
+def fleet_csp_cronologico(problem, max_nodes=50000):
     """Procura por backtracking para encontrar atribuições/ordens válidas.
     Variáveis: ações a atribuir a veículos e sua ordem.
     Domínios: ações permitidas por veículo.
@@ -790,10 +871,10 @@ def fleet_csp(problem, max_nodes=50000):
         return None
     answer = dfs(root)
     if answer is None:
-        return FleetResult("fleet_csp",False,math.inf,nodes,
+        return FleetResult("fleet_csp_cronologico",False,math.inf,nodes,
                            time.perf_counter()-start,{},0,len(ids),
                            f"Sem solução completa ou limite atingido; backtracks={backtracks}")
-    return _fleet_complete(problem,answer,len(ids),nodes,start,"fleet_csp",
+    return _fleet_complete(problem,answer,len(ids),nodes,start,"fleet_csp_cronologico",
                            f"backtracks={backtracks}")
 
 
@@ -827,13 +908,407 @@ def validar_passagem_centro(rotas, centers=None, expected_items=None):
     return True
 
 
+# ============ INSTÂNCIA COMPLETA: AVALIAÇÃO RÁPIDA DE ROTAS ============
+# A procura no espaço de estados (GBFS, A*, CSP cronológico) cresce de forma
+# exponencial com o número de artigos. Para a instância completa (80 artigos)
+# representa-se a solução como uma lista de operações por veículo e usa-se um
+# avaliador rápido, em minutos (float), com a MESMA semântica de _move:
+# janelas sobre o início do serviço, tempo de serviço por paragem, manuseamento
+# no armazém, capacidade, precedência recolha -> armazém -> entrega e horizonte.
+# Todas as soluções finais são ainda reconfirmadas por evaluate_fleet_sequences.
+
+import random
+
+
+class RouteEvaluator:
+    """Avaliador rápido de rotas (uma lista de operações por veículo)."""
+
+    def __init__(self, problem):
+        self.problem = problem
+        t0 = problem.start_time
+        minutes = lambda ts: (ts - t0) / pd.Timedelta(minutes=1)
+        self.req = {r.item_id: dict(P=r.pickup, D=r.delivery, w=r.weight,
+                                    ps=minutes(r.ready), pe=minutes(r.pickup_end),
+                                    ds=minutes(r.delivery_start),
+                                    de=minutes(r.delivery_end))
+                    for r in problem.requests}
+        self.svc = problem.stop_service_min
+        self.hand = problem.warehouse_handling_min
+        self.horizon = (minutes(problem.horizon_end)
+                        if problem.horizon_end is not None else math.inf)
+
+    def _travel(self, a, b):
+        if a == b:
+            return 0.0, 0.0
+        return self.problem.distance[(a, b)], self.problem.duration[(a, b)]
+
+    def evaluate(self, vi, ops, with_times=False):
+        """Distância da rota do veículo vi (com regresso) ou None se inviável."""
+        vehicle = self.problem.vehicles[vi]
+        center = vehicle.center_location
+        loc, t, load, km = center, 0.0, 0.0, 0.0
+        picked, passed, delivered = set(), set(), set()
+        last = None  # (tipo, local, início) da paragem em curso
+        ends = []
+        for kind, item in ops:
+            if kind == "armazem":
+                if not (picked - passed):  # visita inútil ao armazém
+                    return None
+                dk, dm = self._travel(loc, center)
+                km += dk
+                start = t + dm
+                t = start + self.hand
+                loc = center
+                passed |= picked
+                last = ("armazem", center, start)
+            else:
+                r = self.req[item]
+                if kind == "recolha":
+                    if item in picked or load + r["w"] > vehicle.capacity_kg + 1e-9:
+                        return None
+                    target, early, late = r["P"], r["ps"], r["pe"]
+                else:
+                    if item not in passed or item in delivered:
+                        return None
+                    target, early, late = r["D"], r["ds"], r["de"]
+                if (last and last[0] == kind and last[1] == target and loc == target
+                        and early <= last[2] <= late):
+                    pass  # junta-se à paragem em curso, sem novo serviço
+                else:
+                    dk, dm = self._travel(loc, target)
+                    km += dk
+                    start = max(t + dm, early)
+                    if start > late:
+                        return None
+                    t = start + self.svc
+                    loc = target
+                    last = (kind, target, start)
+                if kind == "recolha":
+                    picked.add(item)
+                    load += r["w"]
+                else:
+                    delivered.add(item)
+                    load -= r["w"]
+            if t > self.horizon + 1e-9:
+                return None
+            ends.append(t)
+        if picked != delivered:
+            return None
+        km += self._travel(loc, center)[0]
+        return (km, ends) if with_times else km
+
+    def total(self, routes):
+        values = [self.evaluate(vi, ops) for vi, ops in enumerate(routes)]
+        return None if any(v is None for v in values) else sum(values)
+
+    def insertions(self, routes, item, vehicles=None, limit=None):
+        """Gera as inserções viáveis (aumento_km, veículo, nova_rota) de um artigo.
+
+        A recolha entra na posição i e a entrega na posição j >= i; se não houver
+        passagem pelo armazém entre as duas, insere-se uma imediatamente antes da
+        entrega. As posições são podadas pelo tempo: depois de a rota passar o
+        fim de uma janela, as posições seguintes também a falham.
+        """
+        r = self.req[item]
+        found = 0
+        for vi in (range(len(routes)) if vehicles is None else vehicles):
+            ops = routes[vi]
+            base = self.evaluate(vi, ops, with_times=True)
+            if base is None:
+                continue
+            base_km, ends = base
+            previous_end = [0.0] + ends
+            for i in range(len(ops) + 1):
+                if previous_end[i] > r["pe"]:
+                    break
+                has_warehouse = False
+                for j in range(i, len(ops) + 1):
+                    if j > i and ops[j - 1][0] == "armazem":
+                        has_warehouse = True
+                    if previous_end[j] > r["de"]:
+                        break
+                    middle = ops[i:j]
+                    options = [[("armazem", 0), ("entrega", item)]]
+                    if has_warehouse:
+                        options.insert(0, [("entrega", item)])
+                    for tail in options:
+                        candidate = ops[:i] + [("recolha", item)] + middle + tail + ops[j:]
+                        km = self.evaluate(vi, candidate)
+                        if km is not None:
+                            yield km - base_km, vi, candidate
+                            found += 1
+                            if limit is not None and found >= limit:
+                                return
+
+    def best_insertion(self, routes, item):
+        return min(self.insertions(routes, item), key=lambda x: x[0], default=None)
+
+    def remove(self, routes, items):
+        """Retira artigos das rotas e elimina visitas ao armazém que ficam inúteis."""
+        items = set(items)
+        out = []
+        for vi, ops in enumerate(routes):
+            new = [op for op in ops if op[0] == "armazem" or op[1] not in items]
+            out.append(self._cleanup(vi, new) if len(new) != len(ops) else ops)
+        return out
+
+    def _cleanup(self, vi, ops):
+        changed = True
+        while changed:
+            changed = False
+            for k, (kind, _) in enumerate(ops):
+                if kind == "armazem":
+                    candidate = ops[:k] + ops[k + 1:]
+                    if self.evaluate(vi, candidate) is not None:
+                        ops = candidate
+                        changed = True
+                        break
+        return ops
+
+
+def routes_from_result(problem, result):
+    """Converte um FleetResult em listas de operações (sem o regresso)."""
+    return [[(kind, item) for kind, item, _, _ in result.routes.get(v.vehicle_id, [])
+             if kind != "regresso"] for v in problem.vehicles]
+
+
+def _result_from_routes(problem, routes, algorithm, expanded, start, message="",
+                        history=None):
+    """Reconstrói o FleetResult, revalidando a solução com evaluate_fleet_sequences."""
+    result = evaluate_fleet_sequences(problem, routes)
+    if result is None:
+        raise RuntimeError(f"{algorithm}: solução não passou a revalidação")
+    result.algorithm = algorithm
+    result.expanded = expanded
+    result.message = message
+    result.history = list(history or [])
+    result.runtime_s = time.perf_counter() - start
+    return result
+
+
+def fleet_greedy_repair(problem, heuristic_variant=1):
+    """Greedy construtivo seguido de reparação por inserção mais barata.
+
+    O greedy pode terminar com artigos por entregar; esses artigos são retirados
+    das rotas e reinseridos, um a um (prazo de entrega mais cedo primeiro), na
+    posição viável de menor aumento de distância.
+    """
+    start = time.perf_counter()
+    base = fleet_greedy(problem, heuristic_variant)
+    evaluator = RouteEvaluator(problem)
+    delivered = set()
+    for route in base.routes.values():
+        delivered |= {item for kind, item, _, _ in route if kind == "entrega"}
+    missing = sorted({r.item_id for r in problem.requests} - delivered,
+                     key=lambda i: (evaluator.req[i]["de"], evaluator.req[i]["pe"]))
+    routes = evaluator.remove(routes_from_result(problem, base), missing)
+    failed = []
+    for item in missing:
+        best = evaluator.best_insertion(routes, item)
+        if best is None:
+            failed.append(item)
+            continue
+        routes[best[1]] = best[2]
+    message = (f"greedy entregou {base.delivered}/{base.total}; "
+               f"reparados {len(missing) - len(failed)}")
+    if failed:
+        routes = evaluator.remove(routes, failed)
+        partial = evaluate_fleet_sequences_partial(problem, routes)
+        partial.algorithm = f"greedy_repair_h{heuristic_variant}"
+        partial.message = message + f"; sem inserção viável: {failed}"
+        partial.runtime_s = time.perf_counter() - start
+        return partial
+    return _result_from_routes(problem, routes, f"greedy_repair_h{heuristic_variant}",
+                               base.expanded, start, message)
+
+
+def evaluate_fleet_sequences_partial(problem, sequences):
+    """Como evaluate_fleet_sequences, mas aceita soluções parciais (feasible=False)."""
+    start = time.perf_counter()
+    items = {item for seq in sequences for kind, item in seq if kind == "recolha"}
+    states = [State(v.center_location, problem.start_time) for v in problem.vehicles]
+    for vi, sequence in enumerate(sequences):
+        for kind, item in sequence:
+            found = next((nxt for j, nxt, _, action, article in
+                          _fleet_candidates(problem, tuple(states), items)
+                          if j == vi and action == kind and article == item), None)
+            if found is None:
+                raise RuntimeError("Sequência parcial inviável")
+            states[vi] = found
+    done = set().union(*(s.delivered for s in states))
+    result = _fleet_complete(problem, tuple(states), len(done), 0, start, "parcial")
+    result.feasible = False
+    return result
+
+
+def fleet_csp(problem, max_backtracks=2000, max_values=4, domain_cap=25):
+    """CSP com backtracking, MRV, forward checking e ordenação de valores.
+
+    Variáveis: um artigo (par recolha/entrega) por variável.
+    Domínio:   as inserções viáveis desse par nas rotas atuais dos veículos
+               (veículo + posição da recolha + posição da entrega).
+    Restrições (verificadas pelo avaliador): janelas de recolha e de entrega,
+               capacidade, precedência recolha -> armazém -> entrega,
+               tempo de serviço por paragem e horizonte de planeamento.
+    Heurísticas: MRV escolhe o artigo com menos inserções viáveis (empate:
+               prazo mais cedo); os valores são tentados por ordem de menor
+               aumento de km (só os max_values melhores, para limitar a
+               ramificação); forward checking recua mal algum artigo por
+               atribuir fica com domínio vazio.
+    domain_cap limita a contagem do domínio (o MRV só precisa de distinguir
+    domínios pequenos), o que torna a contagem muito mais barata.
+    """
+    start = time.perf_counter()
+    evaluator = RouteEvaluator(problem)
+    ids = [r.item_id for r in problem.requests]
+    stats = {"nodes": 0, "backtracks": 0}
+    cache = {}
+
+    def domain_size(routes, item):
+        size = 0
+        for vi in range(len(routes)):
+            key = (item, vi, tuple(routes[vi]))
+            if key not in cache:
+                cache[key] = sum(1 for _ in evaluator.insertions(
+                    routes, item, vehicles=[vi], limit=domain_cap))
+            size += cache[key]
+        return size
+
+    def backtrack(routes, unassigned):
+        if not unassigned:
+            return routes
+        if stats["backtracks"] >= max_backtracks:
+            return None
+        sizes = {}
+        for item in unassigned:
+            sizes[item] = domain_size(routes, item)
+            if sizes[item] == 0:  # forward checking: domínio vazio
+                stats["backtracks"] += 1
+                return None
+        item = min(unassigned, key=lambda i: (sizes[i], evaluator.req[i]["de"]))
+        values = sorted(evaluator.insertions(routes, item), key=lambda x: x[0])
+        for _, vi, candidate in values[:max_values]:
+            stats["nodes"] += 1
+            new_routes = list(routes)
+            new_routes[vi] = candidate
+            answer = backtrack(new_routes, unassigned - {item})
+            if answer is not None:
+                return answer
+            if stats["backtracks"] >= max_backtracks:
+                return None
+        stats["backtracks"] += 1
+        return None
+
+    answer = backtrack([[] for _ in problem.vehicles], frozenset(ids))
+    message = f"backtracks={stats['backtracks']}"
+    if answer is None:
+        return FleetResult("csp", False, math.inf, stats["nodes"],
+                           time.perf_counter() - start, {}, 0, len(ids),
+                           f"Sem solução dentro do limite; {message}")
+    return _result_from_routes(problem, answer, "csp", stats["nodes"], start, message)
+
+
+def _relocate_moves(evaluator, routes):
+    """Vizinhança 'relocate': retirar um artigo e reinseri-lo na melhor posição."""
+    for item in evaluator.req:
+        reduced = evaluator.remove(routes, [item])
+        best = evaluator.best_insertion(reduced, item)
+        if best is not None:
+            new = list(reduced)
+            new[best[1]] = best[2]
+            yield item, new
+
+
+def fleet_hill_climbing(problem, initial_result, max_iterations=100):
+    """Hill Climbing (subida mais íngreme) com vizinhança 'relocate'.
+
+    Cada vizinho retira um artigo e reinsere-o na melhor posição viável, no
+    mesmo ou no outro veículo. Em cada iteração aplica-se o melhor vizinho;
+    pára num ótimo local (nenhum vizinho reduz a distância).
+    history guarda a distância após cada iteração (curva custo vs iteração).
+    """
+    start = time.perf_counter()
+    if not initial_result.feasible:
+        return FleetResult("hill_climbing", False, math.inf, 0,
+                           time.perf_counter() - start, {}, 0,
+                           len(problem.requests),
+                           "É necessária uma solução inicial completa")
+    evaluator = RouteEvaluator(problem)
+    routes = routes_from_result(problem, initial_result)
+    current = evaluator.total(routes)
+    history = [current]
+    iterations = 0
+    for _ in range(max_iterations):
+        best_cost, best_routes = current, None
+        for _, candidate in _relocate_moves(evaluator, routes):
+            cost = evaluator.total(candidate)
+            if cost is not None and cost < best_cost - 1e-9:
+                best_cost, best_routes = cost, candidate
+        if best_routes is None:
+            break
+        routes, current = best_routes, best_cost
+        iterations += 1
+        history.append(current)
+    return _result_from_routes(problem, routes, "hill_climbing", iterations, start,
+                               f"inicial={history[0]:.2f} km", history)
+
+
+def fleet_simulated_annealing(problem, initial_result, iterations=1500,
+                              initial_temp=30.0, cooling=0.997, seed=42,
+                              max_removed=3):
+    """Simulated Annealing com vizinhança 'destruir e reconstruir'.
+
+    Cada vizinho retira 1 a max_removed artigos ao acaso e reinsere-os, por
+    ordem aleatória, na melhor posição viável. Um vizinho pior é aceite com
+    probabilidade exp(-delta / T), o que permite sair de ótimos locais;
+    T diminui geometricamente (T <- cooling * T).
+    history guarda a melhor distância encontrada em cada iteração.
+    """
+    start = time.perf_counter()
+    if not initial_result.feasible:
+        return FleetResult("simulated_annealing", False, math.inf, 0,
+                           time.perf_counter() - start, {}, 0,
+                           len(problem.requests),
+                           "É necessária uma solução inicial completa")
+    rng = random.Random(seed)
+    evaluator = RouteEvaluator(problem)
+    items = list(evaluator.req)
+    routes = routes_from_result(problem, initial_result)
+    current = evaluator.total(routes)
+    best_routes, best = routes, current
+    history = [best]
+    temperature = initial_temp
+    accepted = 0
+    for _ in range(iterations):
+        removed = rng.sample(items, rng.randint(1, max_removed))
+        candidate = evaluator.remove(routes, removed)
+        rng.shuffle(removed)
+        for item in removed:
+            insertion = evaluator.best_insertion(candidate, item)
+            if insertion is None:
+                candidate = None
+                break
+            candidate = list(candidate)
+            candidate[insertion[1]] = insertion[2]
+        if candidate is not None:
+            cost = evaluator.total(candidate)
+            delta = cost - current
+            if delta < 0 or rng.random() < math.exp(-delta / max(temperature, 1e-9)):
+                routes, current = candidate, cost
+                accepted += 1
+                if current < best - 1e-9:
+                    best_routes, best = routes, current
+        temperature *= cooling
+        history.append(best)
+    return _result_from_routes(problem, best_routes, "simulated_annealing",
+                               iterations, start,
+                               f"inicial={history[0]:.2f} km; aceites={accepted}",
+                               history)
+
+
 if __name__ == "__main__":
     p = load_fleet_problem("data")
-    p.requests = p.requests[:3]
-    g = fleet_greedy(p)
-    a = fleet_astar(p, max_expansions=2000)
-    h = fleet_hill_climbing(p, a if a.feasible else g)
-    c = fleet_csp(p, max_nodes=2000)
-    print(fleet_summary([g,a,h,c]).to_string(index=False))
-
-
+    g = fleet_greedy_repair(p, 1)
+    h = fleet_hill_climbing(p, g)
+    c = fleet_csp(p)
+    print(fleet_summary([g, h, c]).to_string(index=False))
